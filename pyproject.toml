@@ -1,0 +1,15 @@
+[project]
+name = "hey-pilloo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ai-edge-litert>=2.2.0",
+    "dash>=2.18",
+    "livekit-wakeword[listener]>=0.2.1",
+    "numpy>=1.26",
+    "rich>=15.0.0",
+    "sounddevice>=0.5",
+    "tensorflow>=2.15",
+]

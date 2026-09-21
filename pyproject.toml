@@ -7,9 +7,14 @@ requires-python = ">=3.12"
 dependencies = [
     "ai-edge-litert>=2.2.0",
     "dash>=2.18",
+    "google-genai>=2.19.0",
     "livekit-wakeword[listener]>=0.2.1",
     "numpy>=1.26",
+    "pandas==2.2.3",
     "rich>=15.0.0",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
     "sounddevice>=0.5",
+    "streamlit>=1.37",
     "tensorflow>=2.15",
 ]

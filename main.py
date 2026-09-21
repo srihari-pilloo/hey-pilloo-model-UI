@@ -1,299 +1,277 @@
-"""Dash tester for hey_pilloo_wakeword.tflite.
-
-Run locally on the laptop that has the microphone:
-    python wakeword_dash_test.py --model hey_pilloo_wakeword.tflite
-
-The page displays the detected wake-word count and a visual listening indicator.
-"""
-
-from __future__ import annotations
-
 import argparse
-import threading
-from collections import deque
-from pathlib import Path
+import asyncio
+import sys
+import time
+import os
+from datetime import datetime
+import queue
 
-import numpy as np
-import sounddevice as sd
-from dash import Dash, dcc, html, Input, Output
+from livekit.wakeword import WakeWordModel
 
 try:
-    from tflite_runtime.interpreter import Interpreter
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich.text import Text
+    from rich.console import Console
+    from rich import box
+    RICH_AVAILABLE = True
 except ImportError:
+    RICH_AVAILABLE = False
+    print("Tip: install 'rich' for a nice live dashboard →  pip install rich\n")
+
+
+def make_dashboard(
+    score: float,
+    threshold: float,
+    count: int,
+    last_name: str,
+    last_conf: float,
+    last_time: float,
+    mode: str,
+) -> Panel:
+    bar_len = 40
+    filled = int(min(max(score, 0.0), 1.0) * bar_len)
+    bar = "█" * filled + "░" * (bar_len - filled)
+
+    # Color the bar
+    if score >= threshold:
+        bar_style = "bold green"
+    elif score > threshold * 0.7:
+        bar_style = "yellow"
+    else:
+        bar_style = "dim"
+
+    time_since = f"{time.time() - last_time:.1f}s ago" if last_time > 0 else "—"
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="cyan", justify="right")
+    table.add_column()
+
+    table.add_row("Mode", f"[bold]{mode}[/]")
+    table.add_row("Confidence", f"[{bar_style}]{bar}[/]  {score:.3f}")
+    table.add_row("Threshold", f"{threshold:.3f}")
+    table.add_row("Triggers", f"[bold green]{count}[/]")
+    table.add_row("Last Word", f"[bold]{last_name or '—'}[/]  ({last_conf:.3f})" if last_name else "—")
+    table.add_row("Last Trigger", time_since)
+    table.add_row("Time", datetime.now().strftime("%H:%M:%S"))
+
+    title = "[bold white]Wake Word Live Dashboard[/]"
+    return Panel(
+        table,
+        title=title,
+        border_style="bright_blue",
+        box=box.ROUNDED,
+        padding=(1, 2),
+    )
+
+
+async def run_simple(model_path: str, threshold: float, debounce: float, model_name: str):
+    from livekit.wakeword import WakeWordListener
+
+    model = WakeWordModel(models=[model_path])
+
+    detection_count = 0
+    last_name = ""
+    last_conf = 0.0
+    last_time = 0.0
+    current_score = 0.0
+
+    print(f"Loaded model: {model_path}")
+    print(f"Threshold: {threshold}  |  Debounce: {debounce}s")
+    print("Listening... say your wake word. Ctrl+C to stop.\n")
+
+    if not RICH_AVAILABLE:
+        print(f"{'='*50}")
+        print(f"  DASHBOARD  |  Triggers: {detection_count}")
+        print(f"{'='*50}\n")
+
+    async with WakeWordListener(model, threshold=threshold, debounce=debounce) as listener:
+        if RICH_AVAILABLE:
+            with Live(make_dashboard(0.0, threshold, 0, "", 0.0, 0.0, "SIMPLE"),
+                      refresh_per_second=8, console=Console()) as live:
+                while True:
+                    detection = await listener.wait_for_detection()
+                    detection_count += 1
+                    last_name = detection.name
+                    last_conf = detection.confidence
+                    last_time = time.time()
+                    current_score = detection.confidence
+
+                    live.update(
+                        make_dashboard(
+                            current_score, threshold, detection_count,
+                            last_name, last_conf, last_time, "SIMPLE"
+                        )
+                    )
+        else:
+            # simple fallback
+            while True:
+                detection = await listener.wait_for_detection()
+                detection_count += 1
+                print(f"\033[F\033[K" * 4, end="")
+                print(f"{'='*50}")
+                print(f"  DASHBOARD  |  Triggers: {detection_count}")
+                print(f"{'='*50}")
+                print(f"  DETECTED '{detection.name}'  (confidence={detection.confidence:.3f})")
+
+
+def run_raw(model_path: str, threshold: float, model_name: str):
+    import queue
+    import threading
+    import numpy as np
     try:
-        from ai_edge_litert.interpreter import Interpreter
+        import sounddevice as sd
     except ImportError:
-        try:
-            from tensorflow.lite import Interpreter
-        except ImportError as exc:
-            raise ImportError(
-                "Install one TFLite runtime: tensorflow, ai-edge-litert, or tflite-runtime."
-            ) from exc
+        print("This mode needs sounddevice: pip install sounddevice")
+        sys.exit(1)
 
+    model = WakeWordModel(models=[model_path])
 
-SAMPLE_RATE = 16000
-WINDOW_SAMPLES = SAMPLE_RATE  # The notebook exports a [16000] waveform input.
-BLOCK_SAMPLES = 1600         # 100 ms capture blocks; 10 inferences per second.
-THRESHOLD = 0.50              # Notebook OPERATING_THRESHOLD.
-RELEASE_THRESHOLD = 0.50      # Must fall below this before another trigger is allowed.
-NORMALIZE_PEAK = 0.50         # Same preprocessing as the notebook.
+    detection_count = 0
+    last_conf = 0.0
+    last_time = 0.0
+    last_trigger_time = 0.0
+    COOLDOWN = 1.5
 
+    print(f"Loaded model: {model_path}")
+    print(f"Threshold: {threshold}")
+    print("Listening (raw mode)... Ctrl+C to stop.\n")
 
-class WakeWordListener:
-    def __init__(self, model_path: str, device=None) -> None:
-        self.model_path = Path(model_path)
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"TFLite model not found: {self.model_path}")
+    SAMPLE_RATE = 16000
+    CHUNK_SEC = 0.25
+    WINDOW_SEC = 2.0
+    window_samples = int(SAMPLE_RATE * WINDOW_SEC)
+    chunk_samples = int(SAMPLE_RATE * CHUNK_SEC)
 
-        self.interpreter = Interpreter(model_path=str(self.model_path), num_threads=2)
-        self.interpreter.allocate_tensors()
-        self.input_details = self.interpreter.get_input_details()[0]
-        self.output_details = self.interpreter.get_output_details()[0]
-        self.window = deque(maxlen=WINDOW_SAMPLES)
-        self.lock = threading.Lock()
-        self.trigger_count = 0
-        self.armed = True
-        self.stream = None
-        self.device = device
+    audio_buffer = np.zeros(window_samples, dtype=np.int16)
+    audio_q = queue.Queue()
+    stop_event = threading.Event()
+    state_lock = threading.Lock()
 
-    def _audio_callback(self, indata, frames, time_info, status) -> None:
-        del frames, time_info
+    def callback(indata, frames, time_info, status):
+        # Keep this as fast as possible — no inference here.
         if status:
-            # Do not put status text on the Dash page; the UI is intentionally count-only.
-            pass
-        samples = np.asarray(indata[:, 0], dtype=np.float32)
-        with self.lock:
-            self.window.extend(samples.tolist())
-            if len(self.window) < WINDOW_SAMPLES:
-                return
-            audio = np.asarray(self.window, dtype=np.float32)
+            print(status, file=sys.stderr)
+        audio_q.put(indata[:, 0].copy())
 
-        probability = self.predict(audio)
-        with self.lock:
-            if self.armed and probability >= THRESHOLD:
-                self.trigger_count += 1
-                self.armed = False
-            elif not self.armed and probability < RELEASE_THRESHOLD:
-                self.armed = True
+    def process_loop():
+        nonlocal audio_buffer, detection_count, last_conf, last_time, last_trigger_time
+        while not stop_event.is_set():
+            try:
+                new_chunk = audio_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
 
-    def predict(self, audio: np.ndarray) -> float:
-        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-        if audio.size < WINDOW_SAMPLES:
-            audio = np.pad(audio, (0, WINDOW_SAMPLES - audio.size))
-        elif audio.size > WINDOW_SAMPLES:
-            audio = audio[-WINDOW_SAMPLES:]
+            audio_buffer = np.concatenate([audio_buffer, new_chunk])[-window_samples:]
+            scores = model.predict(audio_buffer)
+            score = scores.get(model_name, list(scores.values())[0] if scores else 0.0)
 
-        # Match load_and_pad_wav(): peak-normalize before the 1-second window is inferred.
-        peak = float(np.max(np.abs(audio)))
-        if peak > 1e-6:
-            audio = audio * (NORMALIZE_PEAK / peak)
+            now = time.time()
+            with state_lock:
+                last_conf = score
+                if score > threshold and (now - last_trigger_time) > COOLDOWN:
+                    detection_count += 1
+                    last_time = now
+                    last_trigger_time = now
 
-        expected_shape = tuple(self.input_details["shape"])
-        if int(np.prod(expected_shape)) != WINDOW_SAMPLES:
-            raise ValueError(
-                f"Expected a TFLite input containing {WINDOW_SAMPLES} samples, "
-                f"but the model input shape is {expected_shape}."
-            )
-        model_input = audio.reshape(expected_shape).astype(self.input_details["dtype"])
-        self.interpreter.set_tensor(self.input_details["index"], model_input)
-        self.interpreter.invoke()
-        output = self.interpreter.get_tensor(self.output_details["index"])
-        return float(np.asarray(output).reshape(-1)[0])
+    worker = threading.Thread(target=process_loop, daemon=True)
+    worker.start()
 
-    def start(self) -> None:
-        if self.stream is not None:
-            return
-        self.stream = sd.InputStream(
+    if RICH_AVAILABLE:
+        console = Console()
+        with Live(make_dashboard(0.0, threshold, 0, model_name, 0.0, 0.0, "RAW"),
+                  refresh_per_second=10, console=console) as live:
+
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=chunk_samples,
+                callback=callback,
+                latency="high",
+            ):
+                try:
+                    while True:
+                        with state_lock:
+                            conf = last_conf
+                            count = detection_count
+                            ltime = last_time
+                        live.update(
+                            make_dashboard(
+                                conf, threshold, count,
+                                model_name, conf, ltime, "RAW"
+                            )
+                        )
+                        sd.sleep(80)
+                except KeyboardInterrupt:
+                    stop_event.set()
+                    print(f"\nStopped. Total triggers: {detection_count}")
+    else:
+        with sd.InputStream(
             samplerate=SAMPLE_RATE,
-            blocksize=BLOCK_SAMPLES,
             channels=1,
-            dtype="float32",
-            device=self.device,
-            callback=self._audio_callback,
-        )
-        self.stream.start()
+            dtype="int16",
+            blocksize=chunk_samples,
+            callback=callback,
+            latency="high",
+        ):
+            try:
+                while True:
+                    with state_lock:
+                        conf = last_conf
+                        count = detection_count
 
-    def stop(self) -> None:
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+                    bar_len = int(min(max(conf, 0.0), 1.0) * 40)
+                    bar = "#" * bar_len + "-" * (40 - bar_len)
+                    marker = " <-- TRIGGER" if conf > threshold else ""
+                    print(
+                        f"\r  DASHBOARD  |  Triggers: {count:<4}  "
+                        f"[{bar}] {conf:.3f}{marker}   ",
+                        end="", flush=True,
+                    )
+                    sd.sleep(80)
+            except KeyboardInterrupt:
+                stop_event.set()
+                print(f"\n\nStopped. Total triggers: {detection_count}")
 
-    def count(self) -> int:
-        with self.lock:
-            return self.trigger_count
-
-    def is_listening(self) -> bool:
-        with self.lock:
-            return self.stream is not None
-
-
-def build_app(listener: WakeWordListener) -> Dash:
-    app = Dash(__name__)
-    app.index_string = """
-    <!DOCTYPE html>
-    <html>
-        <head>
-            {%metas%}
-            <title>Hey Pilloo Wake Word</title>
-            {%favicon%}
-            {%css%}
-            <style>
-                :root {
-                    color-scheme: dark;
-                    font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
-                    background: #080b14;
-                }
-                body {
-                    margin: 0;
-                    min-height: 100vh;
-                    background:
-                        radial-gradient(circle at 50% 35%, #182344 0%, #080b14 48%, #05060b 100%);
-                    color: #f4f7ff;
-                }
-                .wake-card {
-                    min-height: 100vh;
-                    display: flex;
-                    flex-direction: column;
-                    align-items: center;
-                    justify-content: center;
-                    gap: 24px;
-                }
-                .mic-stage {
-                    position: relative;
-                    width: 150px;
-                    height: 150px;
-                    display: grid;
-                    place-items: center;
-                }
-                .mic-ring, .mic-ring::before, .mic-ring::after {
-                    position: absolute;
-                    inset: 0;
-                    border-radius: 50%;
-                    border: 2px solid rgba(94, 234, 212, 0.42);
-                    content: "";
-                    animation: breathe 2.1s ease-out infinite;
-                }
-                .mic-ring::before { animation-delay: 0.7s; }
-                .mic-ring::after { animation-delay: 1.4s; }
-                .mic-core {
-                    width: 78px;
-                    height: 78px;
-                    display: grid;
-                    place-items: center;
-                    border-radius: 50%;
-                    background: linear-gradient(145deg, #5eead4, #38bdf8);
-                    color: #07111f;
-                    box-shadow: 0 0 34px rgba(94, 234, 212, 0.42);
-                    animation: glow 1.3s ease-in-out infinite alternate;
-                    z-index: 1;
-                }
-                .mic-symbol {
-                    font-size: 38px;
-                    line-height: 1;
-                }
-                .listening-label {
-                    margin: 0;
-                    color: #8cf5e4;
-                    font-size: 16px;
-                    letter-spacing: 0.18em;
-                    text-transform: uppercase;
-                }
-                .count-label {
-                    margin: 0;
-                    color: #8e9bb9;
-                    font-size: 13px;
-                    letter-spacing: 0.1em;
-                    text-transform: uppercase;
-                }
-                .trigger-count {
-                    margin: 0;
-                    font-size: clamp(72px, 14vw, 148px);
-                    line-height: 0.9;
-                    font-weight: 750;
-                    letter-spacing: -0.06em;
-                    color: #ffffff;
-                    text-shadow: 0 0 28px rgba(255,255,255,0.16);
-                }
-                @keyframes breathe {
-                    0% { transform: scale(0.52); opacity: 0.9; }
-                    75%, 100% { transform: scale(1.12); opacity: 0; }
-                }
-                @keyframes glow {
-                    from { transform: scale(0.96); box-shadow: 0 0 26px rgba(94, 234, 212, 0.34); }
-                    to { transform: scale(1.04); box-shadow: 0 0 48px rgba(56, 189, 248, 0.62); }
-                }
-            </style>
-        </head>
-        <body>
-            {%app_entry%}
-            <footer>
-                {%config%}
-                {%scripts%}
-                {%renderer%}
-            </footer>
-        </body>
-    </html>
-    """
-    app.layout = html.Main(
-        [
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(className="mic-ring"),
-                            html.Div("\N{MICROPHONE}", className="mic-symbol"),
-                        ],
-                        className="mic-core",
-                    ),
-                ],
-                id="listening-indicator",
-                className="mic-stage",
-            ),
-            html.P("Listening", className="listening-label"),
-            html.P("Triggers detected", className="count-label"),
-            html.H1(id="trigger-count", children="0", className="trigger-count"),
-            dcc.Interval(id="refresh", interval=200, n_intervals=0),
-        ],
-        className="wake-card",
-    )
-
-    @app.callback(
-        Output("trigger-count", "children"),
-        Input("refresh", "n_intervals"),
-    )
-    def update_count(_n_intervals):
-        return str(listener.count())
-
-    return app
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
+def main():
+    parser = argparse.ArgumentParser(description="Live mic test for a wake word model")
+    parser.add_argument("model_path", help="Path to the exported .onnx (or .tflite) model file")
     parser.add_argument(
-        "--model",
-        default="hey_pilloo_wakeword.tflite",
-        help="Path to the TFLite model exported by the notebook.",
+        "--model-name",
+        default=None,
+        help="Wake word key as embedded in the model (defaults to the model filename without extension)",
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8050)
-    parser.add_argument("--device", default=None, help="Optional sounddevice input device name or index.")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Detection threshold. Use the 'optimal_threshold' from your eval output.",
+    )
+    parser.add_argument(
+        "--debounce",
+        type=float,
+        default=2.0,
+        help="Seconds to wait before allowing another detection (simple mode only)",
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Stream continuous confidence scores instead of discrete detections",
+    )
     args = parser.parse_args()
 
-    listener = WakeWordListener(args.model, device=args.device)
-    try:
-        listener.start()
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not open the microphone at exactly 16 kHz. Check the input device and "
-            "sounddevice installation; run `python -m sounddevice` to list devices."
-        ) from exc
+    model_name = args.model_name or os.path.splitext(os.path.basename(args.model_path))[0]
 
-    app = build_app(listener)
-    try:
-        app.run(host=args.host, port=args.port, debug=False)
-    finally:
-        listener.stop()
+    if args.raw:
+        run_raw(args.model_path, args.threshold, model_name)
+    else:
+        try:
+            asyncio.run(run_simple(args.model_path, args.threshold, args.debounce, model_name))
+        except KeyboardInterrupt:
+            print("\nStopped.")
 
 
 if __name__ == "__main__":

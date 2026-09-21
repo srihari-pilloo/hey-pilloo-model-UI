@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+synthetic_recordings/
+wakeword_logs/
+data/
+models-bkp/
